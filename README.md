@@ -241,10 +241,46 @@ npm run dev -- --host 0.0.0.0
 - [ ] **生产级平台能力**  
   多会话调度、观测指标、安全合规、授权音色、合成内容标识。
 
+## FlashTalk 14B 单卡实时优化
+
+> 详细文档: [docs/flashtalk-optim.md](docs/flashtalk-optim.md)
+
+在 NVIDIA RTX PRO 6000 Blackwell (96 GB) 单卡上，将 FlashTalk 14B 从"完全不可用"优化到接近实时对话的过程总结。
+
+### 架构
+
+```
+ASR (DashScope) → LLM (Qwen, 50 字 cap) → TTS (Qwen voice-clone)
+                                            ↓
+             WebRTC ← adaptive prebuffer ← FlashTalk frame gen (FP8a8 + torch.compile)
+```
+
+### 核心优化项
+
+| 优化 | 效果 |
+|---|---|
+| **WSL2/Linux** (规避 Windows torch.compile / torchao 不兼容) | 必要前提 |
+| **torchao FP8a8 + monkey-patch** (W8A8 dynamic FP8 量化) | denoise 0.97 s (-54% vs Windows BF16) |
+| **torch.compile + recompile_limit=64** | VAE decode 保持编译态 |
+| **降解析度** 768×432 → 640×384 (-26% 像素) | T_gen 1.83→1.31 s/chunk (-28%) |
+| **自适应 prebuffer** (动态量测 T_gen，公式计算最低 buffer) | 首音 ~3.5-5 s (vs 固定 8 s) |
+| **LLM 50 字上限** + 详细模式例外 | 控制 chunk 数量，确保不溢出 buffer |
+
+### 效果对比
+
+| 阶段 | 每 chunk 生成 | 首音延迟 |
+|---|---|---|
+| Windows 基线 | 2.13 s | ~10 s |
+| Linux FP8a8 + 768×432 | 1.83 s | ~8 s |
+| **Linux FP8a8 + 640×384 + adaptive** | **1.31 s** | **~3.5-5 s** |
+
+后续方向：加第二张 GPU (model parallel) 可令 T_gen < T_play (1.12 s)，彻底免 prebuffer，首音降至 ~1 s。
+
 ## 文档
 
 - [快速开始](docs/quickstart.md)
 - [FlashTalk + OmniRT 部署](docs/flashtalk-omnirt.md)
+- [FlashTalk 14B 单卡优化](docs/flashtalk-optim.md)
 - [架构说明](docs/architecture.md)
 - [配置说明](docs/configuration.md)
 - [部署文档](docs/deployment.md)（Docker Compose、分布式部署）

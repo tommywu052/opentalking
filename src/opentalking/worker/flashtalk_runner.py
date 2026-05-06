@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import time
@@ -48,81 +49,263 @@ _SENTINEL = object()  # unique marker for "not yet set"
 #   faster than the first LLM sentence is synthesized, the audio queue can go dry
 #   briefly (heard as pause/stutter) — see speak() pipeline ordering.
 # - Coherence with reply: mitigated by system nudge + lead trim, still model-dependent.
+# Keyword-driven TTS openers played the instant speak fires, so the
+# avatar starts talking in ~1.5 s instead of 4-5 s. Each rule maps a
+# set of trigger keywords (matched against user_text) to a few
+# semantically appropriate short phrases. Phrases are kept VERY short
+# (≤8 chars, ≤1 s when TTS'd) so they sound like natural verbal
+# acknowledgements rather than canned filler.
+#
+# Selection flow (see ``_build_tts_opener_candidates`` /
+# ``_select_tts_opener``):
+#   1. First rule whose keywords match user_text contributes its
+#      phrases to the candidate pool, plus the fallback pool.
+#   2. If no rule matches, only the fallbacks are used.
+#   3. Pool is randomly shuffled, then the recent-history filter
+#      pushes recently-used IDs to the back so we don't repeat.
+#   4. Picks the first phrase whose cached PCM passes
+#      ``min_fill_ratio`` (default 0.25 ≈ 0.28 s of audio).
+#
+# Adding a new rule: append a 3-tuple ``(rule_id, keywords, choices)``
+# where choices is a tuple of ``(opener_id, opener_text)``. opener_id
+# must be globally unique (used for cache key + recent history).
 _TTS_OPENER_RULES: tuple[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], ...] = (
+    # ---- original 8 categories (phrases shortened per user feedback) ----
     (
         "greeting",
-        ("你好", "您好", "哈喽", "嗨", "在吗", "早安", "晚安", "喂"),
+        ("你好", "您好", "哈喽", "嗨", "在吗", "早安", "晚安", "喂", "你在吗", "hi"),
         (
-            ("greeting_1", "我在，请讲。"),
-            ("greeting_2", "听到啦，你说。"),
-            ("greeting_3", "随时在。"),
+            ("greeting_1", "嗨，我在。"),
+            ("greeting_2", "你好呀。"),
+            ("greeting_3", "嗯，请讲。"),
         ),
     ),
     (
         "task",
-        ("帮我", "处理", "看下", "看看", "怎么弄", "怎么办", "查一下", "帮忙", "执行", "设置", "找一下"),
+        ("帮我", "处理", "看下", "看看", "怎么弄", "怎么办", "查一下", "帮忙",
+         "执行", "设置", "找一下", "搜一下", "搞定"),
         (
-            ("task_1", "好的，我来看看。"),
-            ("task_2", "明白，马上处理。"),
-            ("task_3", "收到，这就去办。"),
+            ("task_1", "好的。"),
+            ("task_2", "嗯，我看下。"),
+            ("task_3", "马上来。"),
         ),
     ),
     (
         "explain",
-        ("为什么", "怎么", "是什么", "原理", "区别", "原因", "介绍", "详细", "意思"),
+        ("为什么", "怎么", "是什么", "原理", "区别", "原因", "介绍", "详细",
+         "意思", "如何", "讲讲", "说一下"),
         (
-            ("explain_1", "这个我来解释。"),
-            ("explain_2", "好，我给你说明。"),
-            ("explain_3", "马上为你解答。"),
+            ("explain_1", "嗯，我说。"),
+            ("explain_2", "好，简单讲。"),
+            ("explain_3", "这个嘛。"),
         ),
     ),
     (
         "confirm",
-        ("能不能", "可以吗", "是否", "有没有", "行不行", "对不对", "对吗", "真的"),
+        ("能不能", "可以吗", "是否", "有没有", "行不行", "对不对", "对吗",
+         "真的", "是吗", "对吧"),
         (
-            ("confirm_1", "可以，我告诉你。"),
-            ("confirm_2", "这个我来确认。"),
-            ("confirm_3", "稍等，我核实下。"),
+            ("confirm_1", "嗯，可以。"),
+            ("confirm_2", "好，我确认。"),
+            ("confirm_3", "我看看。"),
         ),
     ),
     (
         "create",
-        ("写一个", "写一篇", "生成", "画", "起名", "设计", "草拟", "大纲"),
+        ("写一个", "写一篇", "生成", "画", "起名", "设计", "草拟", "大纲", "做一个"),
         (
-            ("create_1", "好的，这就生成。"),
-            ("create_2", "收到，我来构思。"),
+            ("create_1", "好，我来。"),
+            ("create_2", "嗯，构思下。"),
         ),
     ),
     (
         "calculate",
-        ("算一下", "多少", "统计", "计算", "汇总"),
+        ("算一下", "多少", "统计", "计算", "汇总", "几个", "几次", "总共"),
         (
-            ("calc_1", "我来算一下。"),
-            ("calc_2", "好，这就看数据。"),
+            ("calc_1", "嗯，算下。"),
+            ("calc_2", "好，看数据。"),
         ),
     ),
     (
         "opinion",
-        ("觉得", "看法", "建议", "推荐", "评价", "哪个好"),
+        ("觉得", "看法", "建议", "推荐", "评价", "哪个好", "好不好",
+         "值得吗", "好用吗"),
         (
-            ("opinion_1", "我的看法是这样。"),
-            ("opinion_2", "好，给你几个建议。"),
+            ("opinion_1", "嗯，我说说。"),
+            ("opinion_2", "好，给你建议。"),
         ),
     ),
     (
         "identity",
-        ("你叫什么名字", "你的名字", "你是谁", "怎么称呼", "你叫啥"),
+        ("你叫什么名字", "你的名字", "你是谁", "怎么称呼", "你叫啥", "你叫"),
         (
-            ("identity_1", "嗯，很高兴认识你。"),
+            ("identity_1", "嗯，我介绍下。"),
+            ("identity_2", "嘿，听好了。"),
+        ),
+    ),
+    # ---- new categories ----
+    (
+        "chitchat",
+        ("聊聊", "聊天", "无聊", "好玩", "讲故事", "说说", "讲个", "随便聊",
+         "陪我"),
+        (
+            ("chat_1", "好啊。"),
+            ("chat_2", "嗯，聊什么。"),
+            ("chat_3", "OK。"),
+        ),
+    ),
+    (
+        "weather_time",
+        ("天气", "几点", "今天", "明天", "后天", "日期", "星期",
+         "时间", "今晚", "今早"),
+        (
+            ("wt_1", "嗯，我看下。"),
+            ("wt_2", "好。"),
+        ),
+    ),
+    (
+        "compare",
+        ("还是", "哪个更", "对比", "差异", "区别在", "比起来", "vs", "VS"),
+        (
+            ("cmp_1", "嗯，对比下。"),
+            ("cmp_2", "好，我看。"),
+        ),
+    ),
+    (
+        "translate",
+        ("翻译", "英文", "中文", "什么意思", "用英文说", "怎么说", "英语"),
+        (
+            ("trans_1", "嗯，意思是。"),
+            ("trans_2", "好，翻译下。"),
+        ),
+    ),
+    (
+        "recall",
+        ("记得", "上次", "之前", "刚才", "还记得", "刚说"),
+        (
+            ("recall_1", "嗯，我想想。"),
+            ("recall_2", "稍等下。"),
+        ),
+    ),
+    (
+        "trouble",
+        ("报错", "出错", "不行", "出问题", "失败", "不能用", "坏了",
+         "卡住", "崩了", "卡了"),
+        (
+            ("trbl_1", "嗯，我看下。"),
+            ("trbl_2", "好，帮你看。"),
+        ),
+    ),
+    (
+        "food",
+        ("吃什么", "晚餐", "早餐", "午餐", "喝什么", "推荐吃",
+         "饿了", "宵夜", "下午茶"),
+        (
+            ("food_1", "嗯，看心情。"),
+            ("food_2", "好，给你想想。"),
+        ),
+    ),
+    (
+        "emotion",
+        ("难过", "开心", "累了", "好烦", "孤单", "心情", "压力大",
+         "焦虑", "好累", "委屈"),
+        (
+            ("emo_1", "嗯，我在。"),
+            ("emo_2", "好，跟我说。"),
+        ),
+    ),
+    (
+        "disagree",
+        ("不对", "不是这样", "错了", "你错了", "不太对"),
+        (
+            ("dis_1", "嗯，我重说。"),
+            ("dis_2", "好，再确认。"),
+        ),
+    ),
+    (
+        "thanks",
+        ("谢谢", "感谢", "多谢", "thx", "thanks", "辛苦了"),
+        (
+            ("thx_1", "嗯嗯，不客气。"),
+            ("thx_2", "应该的。"),
+        ),
+    ),
+    (
+        "goodbye",
+        ("再见", "拜拜", "晚安", "下次见", "先这样", "走了", "下线", "byebye"),
+        (
+            ("bye_1", "嗯，再见。"),
+            ("bye_2", "好，拜。"),
+        ),
+    ),
+    (
+        "learning",
+        ("教我", "学一下", "讲解", "课程", "怎么学", "入门"),
+        (
+            ("learn_1", "好，从基础。"),
+            ("learn_2", "嗯，我教你。"),
+        ),
+    ),
+    (
+        "planning",
+        ("计划", "安排", "日程", "打算", "规划", "行程"),
+        (
+            ("plan_1", "好，我安排。"),
+            ("plan_2", "嗯，看下。"),
+        ),
+    ),
+    (
+        "summary",
+        ("总结", "概括", "简短", "简单说", "重点", "要点", "概要"),
+        (
+            ("sum_1", "好，简单说。"),
+            ("sum_2", "嗯，重点是。"),
+        ),
+    ),
+    (
+        "joke",
+        ("笑话", "好笑", "搞笑", "幽默", "段子"),
+        (
+            ("joke_1", "好，听好了。"),
+            ("joke_2", "嗯，讲一个。"),
+        ),
+    ),
+    (
+        "search",
+        ("查询", "搜索", "找资料", "查资料", "查询一下", "百度", "google"),
+        (
+            ("srch_1", "嗯，我查。"),
+            ("srch_2", "好，搜一下。"),
+        ),
+    ),
+    (
+        "story",
+        ("讲故事", "说故事", "童话", "传说", "故事会"),
+        (
+            ("story_1", "嗯，听好了。"),
+            ("story_2", "好，开始啦。"),
+        ),
+    ),
+    (
+        "agree_short",
+        ("是的", "对", "没错", "嗯", "是啊"),
+        (
+            ("agr_1", "嗯嗯。"),
+            ("agr_2", "好的。"),
         ),
     ),
 )
 
+# Fallbacks used when no rule matches — pure short interjections.
+# Padded to 1 chunk by `_select_tts_opener` so they cover the first
+# 1.12 s of avatar mouth time before real content arrives.
 _TTS_OPENER_FALLBACKS: tuple[tuple[str, str], ...] = (
-    ("fallback_1", "明白，马上处理。"),
-    ("fallback_2", "好的，我来看看。"),
-    ("fallback_3", "马上为你解答。"),
-    ("fallback_4", "收到，请稍等。"),
+    ("fb_mm", "嗯嗯"),
+    ("fb_ok", "好的"),
+    ("fb_OK", "OK"),
+    ("fb_got_it", "明白"),
+    ("fb_yep", "好"),
+    ("fb_let_me", "我看下。"),
 )
 
 
@@ -460,11 +643,30 @@ def _iter_tts_opener_variants() -> list[tuple[str, str]]:
 
 
 def _build_tts_opener_candidates(user_text: str) -> list[tuple[str, str]]:
+    """Build a candidate list of TTS openers with rule-aware randomness.
+
+    Strategy:
+      * If a keyword rule matches, its phrases come first (random order),
+        then fallbacks (random order). ``_select_tts_opener`` iterates in
+        list order and returns the first phrase that's not in recent
+        history and passes ``min_fill_ratio`` — so rule-matched phrases
+        are strongly preferred while still rotating across that rule's
+        2-3 variants.
+      * If no rule matches, only fallbacks are used (random order).
+      * ``_remember_tts_opener`` deprioritizes the last N IDs (default 3)
+        so we don't repeat the same opener back-to-back.
+    """
+    import random as _random
     normalized = _normalize_tts_lookup_text(user_text)
+    rule_choices: list[tuple[str, str]] = []
     for _, keywords, choices in _TTS_OPENER_RULES:
         if _contains_any(normalized, keywords):
-            return list(choices) + list(_TTS_OPENER_FALLBACKS)
-    return list(_TTS_OPENER_FALLBACKS)
+            rule_choices = list(choices)
+            break
+    fallbacks = list(_TTS_OPENER_FALLBACKS)
+    _random.shuffle(rule_choices)
+    _random.shuffle(fallbacks)
+    return rule_choices + fallbacks
 
 
 def _trim_trailing_silence_i16(
@@ -522,8 +724,25 @@ async def _synthesize_tts_opener_pcm(
     *,
     sample_rate: int,
     default_voice: str | None = None,
+    tts_provider: str | None = None,
+    tts_model: str | None = None,
 ) -> tuple[np.ndarray, bool]:
-    cache_key = f"v2:{sample_rate}:{default_voice or '_'}:{text}"
+    """Synthesize and cache an opener phrase using the SAME TTS provider as
+    the active session, not the global OPENTALKING_TTS_PROVIDER default.
+
+    Without this fix, `create_tts_adapter` falls back to `_provider()` which
+    reads the env var (typically 'edge'). Sessions using a Qwen voice clone
+    (voice id like ``qwen-tts-vc-...``) then crash with
+    ``ValueError: Invalid voice 'qwen-tts-vc-...'`` because edge_tts only
+    accepts Microsoft voice names.
+
+    Cache key includes provider + model so preload-with-edge and live-with-qwen
+    produce separate entries (cache key collision would replay the wrong PCM).
+    """
+    cache_key = (
+        f"v3:{sample_rate}:{tts_provider or '_'}:{tts_model or '_'}:"
+        f"{default_voice or '_'}:{text}"
+    )
     cached = _TTS_OPENER_PCM_CACHE.get(cache_key)
     if cached is not None:
         return np.array(cached, copy=True), True
@@ -535,7 +754,11 @@ async def _synthesize_tts_opener_pcm(
             return np.array(cached, copy=True), True
 
         tts = create_tts_adapter(
-            sample_rate=sample_rate, chunk_ms=400.0, default_voice=default_voice
+            sample_rate=sample_rate,
+            chunk_ms=400.0,
+            default_voice=default_voice,
+            tts_provider=tts_provider,
+            tts_model=tts_model,
         )
         parts: list[np.ndarray] = []
         try:
@@ -554,10 +777,28 @@ async def _synthesize_tts_opener_pcm(
         return np.array(pcm, copy=True), False
 
 
-async def _preload_tts_openers(sample_rate: int) -> None:
+async def _preload_tts_openers(
+    sample_rate: int,
+    *,
+    default_voice: str | None = None,
+    tts_provider: str | None = None,
+    tts_model: str | None = None,
+) -> None:
+    """Best-effort preload of all opener phrases for the given provider/voice.
+
+    On the first session, this runs in the background while the user is
+    talking. By the time the user finishes their first sentence, most
+    openers are cached and instant.
+    """
     for _, opener_text in _iter_tts_opener_variants():
         try:
-            await _synthesize_tts_opener_pcm(opener_text, sample_rate=sample_rate)
+            await _synthesize_tts_opener_pcm(
+                opener_text,
+                sample_rate=sample_rate,
+                default_voice=default_voice,
+                tts_provider=tts_provider,
+                tts_model=tts_model,
+            )
         except Exception:
             log.warning("Failed to preload TTS opener %r", opener_text, exc_info=True)
 
@@ -1140,6 +1381,8 @@ class FlashTalkRunner:
         sample_rate: int,
         chunk_samples: int,
         default_voice: str | None = None,
+        tts_provider: str | None = None,
+        tts_model: str | None = None,
     ) -> tuple[str, str, np.ndarray, bool, bool] | None:
         s = get_settings()
         if not s.flashtalk_tts_opener_enable:
@@ -1167,6 +1410,8 @@ class FlashTalkRunner:
                     opener_text,
                     sample_rate=sample_rate,
                     default_voice=default_voice,
+                    tts_provider=tts_provider,
+                    tts_model=tts_model,
                 )
             except Exception:
                 log.warning("Failed to synthesize TTS opener %r", opener_text, exc_info=True)
@@ -1375,7 +1620,16 @@ class FlashTalkRunner:
             )
             self._speech_started = True
 
-            self.conversation.add_user(text)
+            # NOTE: We deliberately do NOT call self.conversation.add_user(text)
+            # here. The caller (apps.api.routes.sessions._chat_and_speak) passes
+            # ``text`` = the LLM's REPLY (already-generated assistant_text), not
+            # the user's query. Adding it as a user turn here corrupted the
+            # runner's conversation history and (combined with spoken_prefix
+            # being appended as a synthetic assistant turn) caused the
+            # second-pass LLM call to generate "next-turn engagement questions"
+            # like "小智！想听星星掉进咖啡杯的奇遇故事吗？" on every turn.
+            # The runner's internal LLM call is now also bypassed by default
+            # (see _llm_feeder), so self.conversation is effectively unused.
 
             full_response = ""
             spoken_prefix = ""
@@ -1385,6 +1639,13 @@ class FlashTalkRunner:
             # lip sync better than publishing at TTS start.
             audio_q: asyncio.Queue[tuple[np.ndarray, str | None] | None] = asyncio.Queue(maxsize=8)
             opener_chunk_count: list[int] = [0]
+            # Counters / signal for adaptive prebuffer. Producer increments
+            # `producer_chunks_pushed[0]` for each (pcm, tag) pushed and sets
+            # `producer_done_evt` when no more chunks will arrive. Consumer
+            # uses these to compute the minimum prebuffer required to keep
+            # WebRTC fed without underruns (see consumer comments below).
+            producer_chunks_pushed: list[int] = [0]
+            producer_done_evt = asyncio.Event()
             sample_rate = 16000
             prebuffer_chunks = max(1, _env_int("FLASHTALK_PREBUFFER_CHUNKS", 1))
             boundary_fade_ms = _env_float("FLASHTALK_TTS_BOUNDARY_FADE_MS", 18.0)
@@ -1458,6 +1719,7 @@ class FlashTalkRunner:
                         tag = subtitle if first else None
                         first = False
                         await audio_q.put((chunk, tag))
+                        producer_chunks_pushed[0] += 1
                         if "first_chunk_queued_ms" not in timing:
                             timing["first_chunk_queued_ms"] = (
                                 time.perf_counter() - t_speak_wall0
@@ -1472,6 +1734,8 @@ class FlashTalkRunner:
                         sample_rate=sample_rate,
                         chunk_samples=chunk_samples,
                         default_voice=tts_voice,
+                        tts_provider=tts_provider,
+                        tts_model=tts_model,
                     )
                     if opener is None or self._interrupt.is_set():
                         return
@@ -1663,23 +1927,90 @@ class FlashTalkRunner:
                     return base
 
                 async def _llm_feeder():
-                    """Stream LLM deltas, split into sentences, push to sentence_q."""
+                    """Feed sentences to TTS.
+
+                    Default path (OPENTALKING_FLASHTALK_RUNNER_RELLM=0, the default):
+                      The caller (apps.api.routes.sessions._chat_and_speak) has already
+                      run the LLM and is passing the full answer in ``text``. We just
+                      chunk ``text`` into fake "deltas" and push through the splitter.
+                      This avoids:
+                        - Doubling LLM cost / latency.
+                        - The "LLM keeps repeating 想听星星掉进咖啡杯…" bug, which was
+                          caused by the runner calling LLM AGAIN with a corrupted
+                          context (``self.conversation`` was being fed assistant
+                          replies as user turns + opener as a synthetic assistant
+                          turn → the second LLM call would generate a "next turn"
+                          engagement question instead of the actual reply).
+
+                    Legacy path (set OPENTALKING_FLASHTALK_RUNNER_RELLM=1):
+                      Runner streams from ``self.llm.chat_stream`` directly. Kept for
+                      backward compatibility and any caller that passes a raw user
+                      query as ``text``.
+                    """
                     nonlocal full_response, text_buffer
                     t_llm0 = time.perf_counter()
                     t_first_token: float | None = None
+
+                    # By default the caller already streamed the LLM; we just replay
+                    # the answer locally. Set OPENTALKING_FLASHTALK_RUNNER_RELLM=1
+                    # to force runner to make its own LLM call (legacy/debug only).
+                    use_caller_text = (
+                        os.environ.get("OPENTALKING_FLASHTALK_RUNNER_RELLM", "0").strip()
+                        not in {"1", "true", "yes", "on"}
+                    ) and bool((text or "").strip())
+
                     try:
-                        log.info("LLM streaming started for: %s", text[:50])
-                        async for delta in self.llm.chat_stream(_llm_request_messages()):
-                            if self._interrupt.is_set():
-                                break
-                            piece = strip_emoji(delta)
-                            if t_first_token is None and piece.strip():
-                                t_first_token = time.perf_counter()
-                            full_response += piece
-                            for sentence in splitter.feed(delta):
+                        if use_caller_text:
+                            answer = text or ""
+                            # If an opener already greeted, strip the redundant greeting
+                            # lead from the canned answer up-front (so we don't TTS it).
+                            if spoken_prefix.strip():
+                                trimmed = _strip_redundant_greeting_lead(answer)
+                                if trimmed != answer:
+                                    log.info(
+                                        "Pre-LLM lead trim (opener active): %r -> %r",
+                                        answer[:80],
+                                        trimmed[:80],
+                                    )
+                                answer = trimmed
+
+                            log.info(
+                                "LLM streaming (replay caller text, %d chars): %s",
+                                len(answer),
+                                answer[:50],
+                            )
+
+                            # Chunk size mimics typical LLM SSE delta granularity so
+                            # the SentenceSplitter sees realistic feed timing.
+                            chunk_size = 8
+                            for i in range(0, len(answer), chunk_size):
                                 if self._interrupt.is_set():
                                     break
-                                await _queue_sentence_for_tts(sentence)
+                                delta = answer[i : i + chunk_size]
+                                piece = strip_emoji(delta)
+                                if t_first_token is None and piece.strip():
+                                    t_first_token = time.perf_counter()
+                                full_response += piece
+                                for sentence in splitter.feed(delta):
+                                    if self._interrupt.is_set():
+                                        break
+                                    await _queue_sentence_for_tts(sentence)
+                                # Tiny yield so the TTS worker can start processing
+                                # earlier sentences while we keep filling the buffer.
+                                await asyncio.sleep(0)
+                        else:
+                            log.info("LLM streaming started for: %s", text[:50])
+                            async for delta in self.llm.chat_stream(_llm_request_messages()):
+                                if self._interrupt.is_set():
+                                    break
+                                piece = strip_emoji(delta)
+                                if t_first_token is None and piece.strip():
+                                    t_first_token = time.perf_counter()
+                                full_response += piece
+                                for sentence in splitter.feed(delta):
+                                    if self._interrupt.is_set():
+                                        break
+                                    await _queue_sentence_for_tts(sentence)
 
                         if not self._interrupt.is_set():
                             remainder = splitter.flush()
@@ -1692,7 +2023,8 @@ class FlashTalkRunner:
                             elif text_buffer:
                                 await _queue_sentence_for_tts("", force=True)
 
-                        if spoken_prefix.strip() and full_response.strip():
+                        if not use_caller_text and spoken_prefix.strip() and full_response.strip():
+                            # Legacy path: aggregate trim runs on what LLM produced.
                             agg = full_response.strip()
                             trimmed = _strip_redundant_greeting_lead(agg)
                             if trimmed != agg:
@@ -1752,6 +2084,7 @@ class FlashTalkRunner:
                                 chunk = audio_buffer[:chunk_samples]
                                 audio_buffer = audio_buffer[chunk_samples:]
                                 await audio_q.put((chunk, None))
+                                producer_chunks_pushed[0] += 1
                                 if "first_chunk_queued_ms" not in timing:
                                     timing["first_chunk_queued_ms"] = (
                                         time.perf_counter() - t_speak_wall0
@@ -1768,6 +2101,12 @@ class FlashTalkRunner:
                             await tts.aclose()
                         except Exception:
                             log.exception("TTS adapter aclose failed")
+                    # Set the done event BEFORE pushing the sentinel so the
+                    # consumer (which may have already grabbed the last data
+                    # chunk and is generating frames) sees `producer_done_evt`
+                    # set when it loops back to compute target_prebuffer for
+                    # the next chunk.
+                    producer_done_evt.set()
                     await audio_q.put(None)  # signal done
 
             async def _consumer():
@@ -1781,8 +2120,39 @@ class FlashTalkRunner:
                 flashtalk_chunks = 0
                 generated = 0
                 pending: list[tuple[np.ndarray, list[Any], str | None]] = []
-                n_opener = opener_chunk_count[0]
                 pacing_started = False
+
+                # ADAPTIVE PREBUFFER (auto-tuned by measured T_gen)
+                # ------------------------------------------------
+                # FlashTalk has a "realtime deficit": each chunk takes
+                # T_gen seconds to generate but only T_play (= 1.12 s)
+                # of video plays back. If T_gen > T_play, prebuffer is
+                # mandatory to keep WebRTC fed:
+                #
+                #   prebuffer × T_play ≥ (total - prebuffer) × deficit
+                #     where deficit = T_gen - T_play
+                #   → prebuffer ≥ (deficit / T_gen) × total
+                #
+                # T_gen depends on resolution / quantization / batch /
+                # spike behaviour; hardcoding it is brittle. We measure
+                # `flashtalk_gen_sum_s / generated` after each chunk
+                # and recompute on the fly. With +1 chunk safety margin
+                # and the static `prebuffer_chunks` env as a ceiling,
+                # the formula self-tunes to whatever the actual GPU
+                # throughput is right now.
+                #
+                # Examples (computed live from log):
+                #   768×432, fp8a8 single GPU: T_gen ≈ 1.83 → ratio 0.39
+                #   640×384, fp8a8 single GPU: T_gen ≈ 1.31 → ratio 0.15
+                #   2×GPU model parallel:      T_gen ≈ 0.92 → ratio 0
+                #     (T_gen < T_play, no buffer needed; prebuffer = 1)
+                #
+                # Until the producer signals done, hold up to the
+                # static ceiling (the long-response worst case). TTS
+                # finishes within ~2 s while FlashTalk needs > 2 s for
+                # even a 2-chunk buffer, so producer_done_evt is set
+                # early and the adaptive path kicks in by chunk 2.
+                T_PLAY_SEC = chunk_samples / sample_rate  # 1.12 s
 
                 async def _publish_subtitle_chunk(text: str) -> None:
                     await publish_event(
@@ -1819,28 +2189,65 @@ class FlashTalkRunner:
                     flashtalk_chunks += 1
                     generated += 1
 
-                    if generated <= n_opener:
-                        # Opener chunk: start pacing immediately.
-                        _start_pacing()
-                        if sub_tag:
-                            await _publish_subtitle_chunk(sub_tag)
-                        await self._queue_av_chunk(pcm_chunk, frames)
-                        continue
-
-                    # TTS chunks: if pacing already started (opener present),
-                    # send straight through.
+                    # Once pacing is on, every chunk streams straight to
+                    # WebRTC (its FlashTalk gen took its natural time, no
+                    # artificial gap inserted). Realtime deficit is
+                    # absorbed by the initial prebuffer.
                     if pacing_started:
                         if sub_tag:
                             await _publish_subtitle_chunk(sub_tag)
                         await self._queue_av_chunk(pcm_chunk, frames)
                         continue
 
-                    # No opener — original prebuffer path.
+                    # Pre-pacing: accumulate (opener + real) chunks
+                    # together. opener_chunk_count[0] is informational
+                    # only here — used to label the log line.
                     pending.append((pcm_chunk, frames, sub_tag))
-                    if generated < prebuffer_chunks:
+
+                    # Adaptive prebuffer target (uses measured T_gen).
+                    if producer_done_evt.is_set():
+                        expected_total = producer_chunks_pushed[0]
+                        if expected_total > 0 and generated > 0:
+                            # Live deficit ratio from this session's
+                            # actual generation timings.
+                            avg_t_gen = flashtalk_gen_sum_s / generated
+                            deficit_ratio = max(
+                                0.0,
+                                (avg_t_gen - T_PLAY_SEC) / avg_t_gen,
+                            )
+                            required = max(
+                                1,
+                                math.ceil(deficit_ratio * expected_total) + 1,
+                            )
+                            target_prebuffer = min(required, prebuffer_chunks)
+                        else:
+                            target_prebuffer = 1
+                    else:
+                        target_prebuffer = prebuffer_chunks
+
+                    # Also start pacing if we already have all chunks the
+                    # producer plans to push (covers responses shorter
+                    # than `target_prebuffer`).
+                    have_all = (
+                        producer_done_evt.is_set()
+                        and generated >= producer_chunks_pushed[0]
+                    )
+                    if generated < target_prebuffer and not have_all:
                         continue
 
-                    log.info("Pre-buffer done (%d chunks), starting pacing", generated)
+                    n_opener_log = opener_chunk_count[0]
+                    avg_t_gen_log = (
+                        flashtalk_gen_sum_s / max(generated, 1)
+                    )
+                    log.info(
+                        "Pre-buffer done (%d/%d chunks; %d opener + %d real, "
+                        "expected_total=%s, avg_T_gen=%.2fs, T_play=%.2fs), "
+                        "starting pacing",
+                        generated, target_prebuffer,
+                        n_opener_log, generated - n_opener_log,
+                        producer_chunks_pushed[0] if producer_done_evt.is_set() else "?",
+                        avg_t_gen_log, T_PLAY_SEC,
+                    )
                     _start_pacing()
                     for pc, bf, st in pending:
                         if st:
@@ -1855,6 +2262,7 @@ class FlashTalkRunner:
                         if st:
                             await _publish_subtitle_chunk(st)
                         await self._queue_av_chunk(pc, buffered_frames)
+                    pending.clear()
 
                 timing["flashtalk_generate_sum_ms"] = flashtalk_gen_sum_s * 1000.0
                 timing["flashtalk_chunks"] = float(flashtalk_chunks)
@@ -1939,7 +2347,12 @@ class FlashTalkRunner:
             )
 
             stored_response = _merge_spoken_reply(spoken_prefix, full_response)
-            if stored_response:
+            # NOTE: Conversation history is owned by apps/api/routes/sessions.py
+            # (per-session app.state.llm_conversations). Don't update the
+            # runner's local self.conversation — it would diverge from the
+            # canonical history and we no longer use it (runner's LLM call is
+            # bypassed by default; see _llm_feeder).
+            if False and stored_response:  # disabled: see note above
                 self.conversation.add_assistant(stored_response)
 
             await self._publish_speech_ended(stored_response)
